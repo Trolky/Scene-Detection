@@ -1,4 +1,4 @@
-opencv-python
-numpy
+opencv-python~=4.13.0.92
+numpy~=2.2.6
 scenedetect[opencv]
-tqdm
+tqdm~=4.67.3

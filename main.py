@@ -1,11 +1,24 @@
 import cv2
 import json
+import logging
 import numpy as np
 import os
+import subprocess
 import sys
+import tempfile
+import wave
 from typing import List, Dict, Optional
 from tqdm import tqdm
 import time
+
+try:
+    import pytesseract
+    from PIL import Image
+    _HAS_OCR = True
+except ImportError:
+    _HAS_OCR = False
+
+logger = logging.getLogger("SlideDetector")
 
 class SlideDetector:
     """
@@ -17,7 +30,10 @@ class SlideDetector:
                  check_interval: float = 0.5, similarity_threshold: float = 2.0,
                  min_changed_blocks: int = 4, camera_segment_min_count: int = 5,
                  confirm_transitions: bool = True, use_face_detection: bool = True,
-                 face_area_threshold: float = 0.15):
+                 face_area_threshold: float = 0.15,
+                 use_ocr: bool = True, ocr_lang: str = "ces+eng",
+                 use_audio_validation: bool = True, audio_sr: int = 16000,
+                 confidence_threshold: float = 0.6):
         """
         Initializes the SlideDetector.
 
@@ -53,6 +69,14 @@ class SlideDetector:
         self.confirm_transitions = confirm_transitions
         self.use_face_detection = use_face_detection
         self.face_area_threshold = face_area_threshold
+        self.use_ocr = use_ocr and _HAS_OCR
+        if use_ocr and not _HAS_OCR:
+            logger.warning("pytesseract/PIL not installed (`pip install pytesseract pillow` "
+                           "and a Tesseract binary). OCR disabled.")
+        self.ocr_lang = ocr_lang
+        self.use_audio_validation = use_audio_validation
+        self.audio_sr = audio_sr
+        self.confidence_threshold = confidence_threshold
         self.slides: List[Dict] = []
 
         # Internal state
@@ -60,6 +84,7 @@ class SlideDetector:
         self._fps = 0.0
         self._total_frames = 0
         self._duration = 0.0
+        self._audio_data: Optional[np.ndarray] = None
         self._face_cascade: Optional[cv2.CascadeClassifier] = None
         self._profile_cascade: Optional[cv2.CascadeClassifier] = None
         if use_face_detection:
@@ -133,10 +158,40 @@ class SlideDetector:
             return True
         return self._calculate_change_percentage(prev_frame, confirm_frame) > self.threshold_percent
 
+    def _setup_logging(self) -> None:
+        """
+        Wires up a per-video FileHandler that writes detection.log next to the
+        exported slides. Removes any FileHandler from a previous run to keep
+        logs from bleeding between videos when the same process processes
+        many files in a loop. A single shared StreamHandler (stdout) is also
+        attached the first time so progress stays visible interactively.
+        """
+        logger.setLevel(logging.INFO)
+
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                logger.removeHandler(h)
+                h.close()
+
+        if self.output_dir:
+            log_path = os.path.join(self.output_dir, "detection.log")
+            file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+            ))
+            logger.addHandler(file_handler)
+
+        if not any(isinstance(h, logging.StreamHandler)
+                   and not isinstance(h, logging.FileHandler)
+                   for h in logger.handlers):
+            stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(stream_handler)
+
     def _initialize_capture(self) -> bool:
-        """Opens the video capture and reads metadata."""
+        """Opens the video capture, reads metadata and configures per-video logging."""
         if not os.path.exists(self.video_path):
-            print(f"Error: File '{self.video_path}' does not exist.")
+            logger.error(f"File '{self.video_path}' does not exist.")
             return False
 
         if self.output_dir:
@@ -144,20 +199,24 @@ class SlideDetector:
             self.output_dir = os.path.join(self.output_dir, video_name)
             if not os.path.exists(self.output_dir):
                 os.makedirs(self.output_dir)
-                print(f"Created output directory: {self.output_dir}")
+
+        self._setup_logging()
+        if self.output_dir:
+            logger.info(f"Output directory: {self.output_dir}")
 
         self._cap = cv2.VideoCapture(self.video_path)
 
         if not self._cap.isOpened():
-            print("Error: Could not open video source.")
+            logger.error("Could not open video source.")
             return False
 
         self._fps = self._cap.get(cv2.CAP_PROP_FPS)
         self._total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._duration = self._total_frames / self._fps
 
-        print(f"Analyzing video: {self.video_path}")
-        print(f"Duration: {self.format_time(self._duration)} ({self._duration:.2f}s), FPS: {self._fps:.2f}")
+        logger.info(f"Analyzing video: {self.video_path}")
+        logger.info(f"Duration: {self.format_time(self._duration)} ({self._duration:.2f}s), "
+                    f"FPS: {self._fps:.2f}")
         return True
 
     def _load_frame_at_time(self, timestamp: float) -> Optional[np.ndarray]:
@@ -211,7 +270,7 @@ class SlideDetector:
         if not slides:
             return slides
 
-        print("\n[Post-processing: checking short slides for false transitions...]")
+        logger.info("\n[Post-processing: checking short slides for false transitions...]")
 
         merged = True
         while merged:
@@ -270,7 +329,7 @@ class SlideDetector:
                     # prev and next are the same slide → merge all three
                     prev = new_slides[-1]
                     nxt = slides[i + 1]
-                    print(f"  Slide {slide['id']} ({slide['duration']:.2f}s): slide {prev['id']} (before) "
+                    logger.info(f"  Slide {slide['id']} ({slide['duration']:.2f}s): slide {prev['id']} (before) "
                           f"and slide {nxt['id']} (after) match → merging all three into slide {prev['id']}")
                     prev["end"] = nxt["end"]
                     prev["duration"] = prev["end"] - prev["start"]
@@ -280,7 +339,7 @@ class SlideDetector:
                 elif similar_to_prev:
                     # Absorb into previous slide
                     prev = new_slides[-1]
-                    print(f"  Slide {slide['id']} ({slide['duration']:.2f}s) matches PREVIOUS "
+                    logger.info(f"  Slide {slide['id']} ({slide['duration']:.2f}s) matches PREVIOUS "
                           f"slide {prev['id']} → merging into slide {prev['id']}")
                     prev["end"] = slide["end"]
                     prev["duration"] = prev["end"] - prev["start"]
@@ -290,7 +349,7 @@ class SlideDetector:
                 elif similar_to_next:
                     # Absorb into next slide (modify it in-place before we process it)
                     nxt = slides[i + 1]
-                    print(f"  Slide {slide['id']} ({slide['duration']:.2f}s) matches NEXT "
+                    logger.info(f"  Slide {slide['id']} ({slide['duration']:.2f}s) matches NEXT "
                           f"slide {nxt['id']} → merging into slide {nxt['id']}")
                     slides[i + 1] = {**nxt, "start": slide["start"],
                                      "duration": nxt["end"] - slide["start"]}
@@ -305,7 +364,7 @@ class SlideDetector:
                     # handled above by similar_prev_to_next, so it never reaches this branch.
                     if has_next:
                         nxt = slides[i + 1]
-                        print(f"  Slide {slide['id']} ({slide['duration']:.2f}s) is unique but too short "
+                        logger.info(f"  Slide {slide['id']} ({slide['duration']:.2f}s) is unique but too short "
                               f"→ merging into next slide {nxt['id']}")
                         slides[i + 1] = {**nxt, "start": slide["start"],
                                          "duration": nxt["end"] - slide["start"]}
@@ -313,7 +372,7 @@ class SlideDetector:
                         i += 1
                     elif has_prev:
                         prev = new_slides[-1]
-                        print(f"  Slide {slide['id']} ({slide['duration']:.2f}s) is unique but too short "
+                        logger.info(f"  Slide {slide['id']} ({slide['duration']:.2f}s) is unique but too short "
                               f"→ merging into previous slide {prev['id']}")
                         prev["end"] = slide["end"]
                         prev["duration"] = prev["end"] - prev["start"]
@@ -349,7 +408,7 @@ class SlideDetector:
         if self.camera_segment_min_count <= 0:
             return slides
 
-        print("\n[Post-processing: merging consecutive short-slide runs...]")
+        logger.info("\n[Post-processing: merging consecutive short-slide runs...]")
         result: List[Dict] = []
         i = 0
         while i < len(slides):
@@ -364,7 +423,7 @@ class SlideDetector:
                     merged_end = slides[j - 1]["end"]
                     seg_start = self.format_time(merged_start)
                     seg_end = self.format_time(merged_end)
-                    print(f"  Merged segment: {count} consecutive short slides "
+                    logger.info(f"  Merged segment: {count} consecutive short slides "
                           f"[{seg_start} – {seg_end}] → 1 slide")
                     result.append({
                         "id": 0,
@@ -404,7 +463,7 @@ class SlideDetector:
         cascades = [c for c in (self._face_cascade, self._profile_cascade)
                     if c is not None and not c.empty()]
 
-        print("\n[Post-processing: camera reclassification (face + color)...]")
+        logger.info("\n[Post-processing: camera reclassification (face + color)...]")
         for slide in slides:
             if slide["type"] == "camera":
                 continue
@@ -458,7 +517,7 @@ class SlideDetector:
             cap.release()
 
             if reason:
-                print(f"  Slide {slide['id']} [{self.format_time(slide['start'])} – "
+                logger.info(f"  Slide {slide['id']} [{self.format_time(slide['start'])} – "
                       f"{self.format_time(slide['end'])}] → {reason} → camera")
                 slide["type"] = "camera"
 
@@ -483,7 +542,7 @@ class SlideDetector:
             if j > i + 1:
                 merged_start = slides[i]["start"]
                 merged_end = slides[j - 1]["end"]
-                print(f"  Merging {j - i} consecutive {seg_type} segments "
+                logger.info(f"  Merging {j - i} consecutive {seg_type} segments "
                       f"[{self.format_time(merged_start)} – {self.format_time(merged_end)}]")
                 result.append({
                     "id": 0,
@@ -536,7 +595,7 @@ class SlideDetector:
         contains a dark application-window overlay on a light slide background.
         Runs after face-detection reclassification so camera segments are skipped.
         """
-        print("\n[Post-processing: demo-overlay detection...]")
+        logger.info("\n[Post-processing: demo-overlay detection...]")
         for slide in slides:
             if slide["type"] != "slide":
                 continue
@@ -547,9 +606,96 @@ class SlideDetector:
             ret, frame = cap.read()
             cap.release()
             if ret and self._has_demo_overlay(frame):
-                print(f"  Slide {slide['id']} [{self.format_time(slide['start'])} – "
+                logger.info(f"  Slide {slide['id']} [{self.format_time(slide['start'])} – "
                       f"{self.format_time(slide['end'])}] → demo overlay → reclassified as demo")
                 slide["type"] = "demo"
+        return slides
+
+    def _is_progressive_build(self, frame_a: np.ndarray, frame_b: np.ndarray,
+                               top_ratio: float = 0.55, top_threshold: float = 1.5,
+                               bottom_min_change: float = 2.0) -> bool:
+        """
+        Returns True when frame_b looks like frame_a with extra content
+        revealed in its lower portion (PowerPoint/Keynote progressive build).
+
+        Conditions, all required:
+          * Top `top_ratio` of the frames is visually identical
+            (change_pct < top_threshold) — heading and earlier bullets unchanged.
+          * Bottom region differs (change_pct > bottom_min_change) — a real
+            content delta exists, not just identical-frame noise.
+          * The bottom of frame_b has higher pixel std than the bottom of
+            frame_a — guards against the reverse case where content was
+            REMOVED from the bottom (which is not a forward build).
+
+        Frames are expected to be preprocessed (grayscale + Gaussian blur),
+        as returned by _load_frame_at_time.
+        """
+        h = frame_a.shape[0]
+        cut = int(h * top_ratio)
+        top_change = self._calculate_change_percentage(frame_a[:cut], frame_b[:cut])
+        if top_change >= top_threshold:
+            return False
+
+        bot_a, bot_b = frame_a[cut:], frame_b[cut:]
+        bottom_change = self._calculate_change_percentage(bot_a, bot_b)
+        if bottom_change < bottom_min_change:
+            return False
+
+        return float(bot_b.std()) > float(bot_a.std()) * 1.10
+
+    def _merge_progressive_builds(self, slides: List[Dict]) -> List[Dict]:
+        """
+        Merges adjacent 'slide' pairs that look like a progressive build —
+        a single slide revealing bullets one at a time. Without this pass
+        each reveal step is detected as a separate slide, fragmenting the
+        downstream audio chunk and pointing each chunk at an incomplete
+        thumbnail.
+
+        The merged segment keeps the LATER slide's representative frame
+        (it's the most complete version of the slide) and extends start
+        backward to the first reveal step's start. Loops until no further
+        merges occur — handles N-step builds.
+        """
+        if not slides:
+            return slides
+
+        logger.info("\n[Post-processing: merging progressive builds...]")
+        merged = True
+        passes = 0
+        while merged:
+            merged = False
+            passes += 1
+            new_slides: List[Dict] = []
+            i = 0
+            while i < len(slides):
+                if (i + 1 < len(slides)
+                        and slides[i]["type"] == "slide"
+                        and slides[i + 1]["type"] == "slide"):
+                    f1 = self._load_frame_at_time(
+                        (slides[i].get("content_start", slides[i]["start"]) + slides[i]["end"]) / 2
+                    )
+                    f2 = self._load_frame_at_time(
+                        (slides[i + 1].get("content_start", slides[i + 1]["start"]) + slides[i + 1]["end"]) / 2
+                    )
+                    if (f1 is not None and f2 is not None
+                            and self._is_progressive_build(f1, f2)):
+                        logger.info(f"  Slides {slides[i]['id']} → {slides[i + 1]['id']} "
+                                    f"look like a progressive build → merging "
+                                    f"(keeping slide {slides[i + 1]['id']}'s frame)")
+                        new_slides.append({
+                            **slides[i + 1],
+                            "start": slides[i]["start"],
+                            "duration": slides[i + 1]["end"] - slides[i]["start"],
+                        })
+                        merged = True
+                        i += 2
+                        continue
+                new_slides.append(slides[i])
+                i += 1
+            slides = new_slides
+
+        for idx, slide in enumerate(slides, start=1):
+            slide["id"] = idx
         return slides
 
     def _merge_similar_adjacent(self, slides: List[Dict]) -> List[Dict]:
@@ -562,7 +708,7 @@ class SlideDetector:
         if not slides:
             return slides
 
-        print("\n[Post-processing: merging visually identical adjacent slides...]")
+        logger.info("\n[Post-processing: merging visually identical adjacent slides...]")
         merged = True
         while merged:
             merged = False
@@ -580,7 +726,7 @@ class SlideDetector:
                     )
                     if (f1 is not None and f2 is not None
                             and self._calculate_change_percentage(f1, f2) < self.similarity_threshold):
-                        print(f"  Slides {slides[i]['id']} and {slides[i + 1]['id']} "
+                        logger.info(f"  Slides {slides[i]['id']} and {slides[i + 1]['id']} "
                               f"are visually identical → merging")
                         new_slides.append({
                             **slides[i],
@@ -631,11 +777,159 @@ class SlideDetector:
         cap.release()
         return best_frame
 
+    def _load_audio(self) -> Optional[np.ndarray]:
+        """
+        Extracts mono PCM audio at audio_sr Hz using ffmpeg via subprocess.
+
+        Returns float32 samples in [-1, 1], or None when ffmpeg is unavailable
+        or the source has no audio track. Used downstream for silence-based
+        cross-validation of slide boundaries — a real slide change is almost
+        always preceded by a brief speaker pause.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", self.video_path,
+                 "-ac", "1", "-ar", str(self.audio_sr),
+                 "-vn", "-loglevel", "error", tmp.name],
+                check=True, capture_output=True,
+            )
+            with wave.open(tmp.name, "rb") as wf:
+                frames = wf.readframes(wf.getnframes())
+            return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        except (subprocess.CalledProcessError, FileNotFoundError, wave.Error) as e:
+            logger.warning(f"Audio extraction failed ({type(e).__name__}). "
+                           "Audio cross-validation disabled — install ffmpeg and add it to "
+                           "PATH to enable.")
+            return None
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+    def _silence_score_at(self, t: float, window: float = 0.5) -> float:
+        """
+        Returns a 0..1 score indicating how strongly t coincides with a local
+        audio silence. 1.0 = clear pause at t; ~0.2 = no dip at all.
+
+        Computes 50 ms RMS frames in a ±window region around t. The dip ratio
+        (min RMS / mean RMS) measures how much the quietest frame stands out
+        from the surrounding speech. A small dip ratio → strong silence.
+
+        Returns 0.5 (neutral) when audio is unavailable or the segment is too
+        short to estimate reliably.
+        """
+        if self._audio_data is None:
+            return 0.5
+
+        sr = self.audio_sr
+        frame_size = int(sr * 0.05)
+        half = int(window * sr)
+        center = int(t * sr)
+        start_idx = max(0, center - half)
+        end_idx = min(len(self._audio_data), center + half)
+
+        segment = self._audio_data[start_idx:end_idx]
+        n_frames = len(segment) // frame_size
+        if n_frames < 4:
+            return 0.5
+
+        rms = np.sqrt(np.mean(
+            segment[: n_frames * frame_size].reshape(n_frames, frame_size) ** 2,
+            axis=1,
+        ))
+        mean_rms = float(rms.mean())
+        if mean_rms < 1e-6:
+            return 1.0  # whole region is silent
+
+        dip_ratio = float(rms.min()) / mean_rms
+        return float(np.clip(1.0 - dip_ratio, 0.2, 1.0))
+
+    def _boundary_confidence(self, t: float) -> Dict[str, float]:
+        """
+        Combines visual delta and audio silence into a confidence score that
+        a real slide transition occurred at time t. Returns sub-scores for
+        transparency in the JSON output.
+
+        Visual: change percentage and changed-block count between the frames
+        one check_interval before and after t. Strong transitions easily
+        exceed change_pct = 20 % and saturate ~12/16 blocks.
+        Audio: silence dip ratio in a ±0.5 s window around t.
+        Combined: 0.6 · visual + 0.4 · audio (visual is the primary signal).
+        """
+        eps = self.check_interval
+        f_before = self._load_frame_at_time(max(0.0, t - eps))
+        f_after = self._load_frame_at_time(min(self._duration, t + eps))
+
+        if f_before is None or f_after is None:
+            visual_score = 0.5
+        else:
+            change_pct = self._calculate_change_percentage(f_before, f_after)
+            blocks = self._count_changed_blocks(f_before, f_after)
+            visual_score = float(np.clip(
+                0.5 * (change_pct / 20.0) + 0.5 * (blocks / 16.0),
+                0.0, 1.0,
+            ))
+
+        audio_score = self._silence_score_at(t) if self.use_audio_validation else 0.5
+        combined = 0.6 * visual_score + 0.4 * audio_score
+        return {"visual": round(visual_score, 3),
+                "audio": round(audio_score, 3),
+                "combined": round(combined, 3)}
+
+    def _annotate_with_confidence(self, slides: List[Dict]) -> List[Dict]:
+        """
+        Computes a confidence score for each slide based on the strength of
+        its start-of-slide transition (visual delta + audio silence). Sets
+        'needs_review' True when confidence < confidence_threshold so a
+        downstream UI can quickly surface uncertain boundaries.
+
+        The first slide always gets confidence 1.0 — its start at t = 0 is
+        not the result of detection.
+        """
+        logger.info("\n[Post-processing: scoring boundary confidence...]")
+        flagged = 0
+        for idx, slide in enumerate(slides):
+            if idx == 0:
+                slide["confidence"] = 1.0
+                slide["confidence_breakdown"] = {"visual": 1.0, "audio": 1.0, "combined": 1.0}
+            else:
+                scores = self._boundary_confidence(slide["start"])
+                slide["confidence"] = scores["combined"]
+                slide["confidence_breakdown"] = scores
+            slide["needs_review"] = slide["confidence"] < self.confidence_threshold
+            if slide["needs_review"]:
+                flagged += 1
+                cb = slide["confidence_breakdown"]
+                logger.info(f"  Slide {slide['id']} [{self.format_time(slide['start'])}] "
+                      f"confidence={slide['confidence']:.2f} "
+                      f"(visual={cb['visual']:.2f}, audio={cb['audio']:.2f}) → review")
+        logger.info(f"  {flagged}/{len(slides)} slides flagged for manual review "
+              f"(threshold={self.confidence_threshold})")
+        return slides
+
+    def _ocr_slide_image(self, image_path: str) -> str:
+        """
+        Runs Tesseract OCR on a saved slide image and returns a single-line
+        string with collapsed whitespace. Returns "" on any failure (missing
+        binary, unsupported language pack, unreadable image).
+        """
+        if not self.use_ocr:
+            return ""
+        try:
+            img = Image.open(image_path)
+            text = pytesseract.image_to_string(img, lang=self.ocr_lang)
+            return " ".join(text.split())
+        except Exception:
+            return ""
+
     def _export_slide_images(self, slides: List[Dict]):
-        """Saves the sharpest representative frame for each final (post-merge) slide."""
+        """Saves the sharpest representative frame for each final slide and runs OCR if enabled."""
         if not self.output_dir:
             return
-        print("\n[Exporting slide images...]")
+        logger.info("\n[Exporting slide images...]")
         for slide in slides:
             frame = self._best_frame_at_slide(slide)
             if frame is not None:
@@ -643,8 +937,12 @@ class SlideDetector:
                 filepath = os.path.join(self.output_dir, filename)
                 cv2.imwrite(filepath, frame)
                 slide["image"] = filename
-                print(f"  {filename}  [{self.format_time(slide['start'])} – {self.format_time(slide['end'])}]"
-                      f"  type={slide['type']}")
+                slide["text"] = (self._ocr_slide_image(filepath)
+                                 if self.use_ocr and slide["type"] == "slide" else "")
+                preview = (slide["text"][:60] + "...") if len(slide["text"]) > 60 else slide["text"]
+                logger.info(f"  {filename}  [{self.format_time(slide['start'])} – {self.format_time(slide['end'])}]"
+                      f"  type={slide['type']}  conf={slide.get('confidence', 1.0):.2f}"
+                      + (f"  text={preview!r}" if preview else ""))
 
     def _export_json(self, slides: List[Dict]):
         """
@@ -666,12 +964,15 @@ class SlideDetector:
                 "duration": round(s["duration"], 3),
                 "type": s["type"],
                 "image": s["image"],
+                "text": s.get("text", ""),
+                "confidence": round(float(s.get("confidence", 1.0)), 3),
+                "needs_review": bool(s.get("needs_review", False)),
             }
             for s in slides
         ]
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
-        print(f"\n[Exported metadata → {path}]")
+        logger.info(f"\n[Exported metadata → {path}]")
 
     def run(self) -> List[Dict]:
         """
@@ -682,6 +983,13 @@ class SlideDetector:
         """
         if not self._initialize_capture():
             return []
+
+        if self.use_audio_validation:
+            logger.info("[Loading audio for cross-validation...]")
+            self._audio_data = self._load_audio()
+            if self._audio_data is not None:
+                logger.info(f"  Loaded {len(self._audio_data) / self.audio_sr:.1f}s of audio "
+                      f"@ {self.audio_sr} Hz")
 
         step_frames = int(self._fps * self.check_interval)
         if step_frames < 1:
@@ -699,7 +1007,7 @@ class SlideDetector:
         prev_frame_processed = self._preprocess_frame(frame)
         frame_counter = 0
 
-        print(f"\n[Processing...]")
+        logger.info(f"\n[Processing...]")
 
         n_checks = self._total_frames // step_frames
         pbar = tqdm(total=n_checks, desc="Detected: 0", unit="checks")
@@ -785,28 +1093,36 @@ class SlideDetector:
         # Post-process: merge consecutive segments of the same non-content type (camera / demo)
         self.slides = self._merge_consecutive_noncontent(self.slides)
 
+        # Post-process: collapse PowerPoint-style progressive builds (bullet-by-bullet reveals)
+        self.slides = self._merge_progressive_builds(self.slides)
+
         # Post-process: merge visually identical adjacent slides (false transitions)
         self.slides = self._merge_similar_adjacent(self.slides)
 
-        # Export final slide images (after merging, with correct numbering)
+        # Score each final boundary (visual delta + audio silence) → confidence + review flag
+        self.slides = self._annotate_with_confidence(self.slides)
+
+        # Export final slide images (after merging, with correct numbering); runs OCR per image
         self._export_slide_images(self.slides)
 
         # Export JSON metadata for downstream pipeline consumption
         self._export_json(self.slides)
 
-        print("\n" + "=" * 60)
+        logger.info("\n" + "=" * 60)
         for slide in self.slides:
-            print(f"Slide {slide['id']} [{slide['type']:6s}]: {self.format_time(slide['start'])} - "
-                  f"{self.format_time(slide['end'])} ({slide['duration']:.2f}s)")
-        print("=" * 60 + "\n")
+            flag = " [REVIEW]" if slide.get("needs_review") else ""
+            logger.info(f"Slide {slide['id']} [{slide['type']:6s}]: {self.format_time(slide['start'])} - "
+                  f"{self.format_time(slide['end'])} ({slide['duration']:.2f}s) "
+                  f"conf={slide.get('confidence', 1.0):.2f}{flag}")
+        logger.info("=" * 60 + "\n")
 
         return self.slides
 
 
 if __name__ == "__main__":
-    video_files =["videos/test_video_1.mp4", "videos/test_video_2.mp4", "videos/test_video_3.mp4",
-                  "videos/test_video_4.mp4", "videos/test_video_5.mp4"]
-    # video_files = ["videos/test_video_3.mp4"]
+    # video_files =["videos/test_video_1.mp4", "videos/test_video_2.mp4", "videos/test_video_3.mp4",
+    #               "videos/test_video_4.mp4", "videos/test_video_5.mp4"]
+    video_files = ["videos/test_video_1.mp4"]
     if len(sys.argv) > 1:
         video_file = sys.argv[1]
     for video_file in video_files:
@@ -816,8 +1132,12 @@ if __name__ == "__main__":
             threshold_percent=5,
             min_duration=10,
             similarity_threshold=5,
-            min_changed_blocks=4,       # ignore changes in < 4/16 blocks (e.g. PiP camera corner)
-            camera_segment_min_count=5, # remove runs of >=5 consecutive short slides (fullscreen camera)
+            min_changed_blocks=4,        # ignore changes in < 4/16 blocks (e.g. PiP camera corner)
+            camera_segment_min_count=5,  # remove runs of >=5 consecutive short slides (fullscreen camera)
             face_area_threshold=0.15,
+            use_ocr=True,                # OCR slide text for STT-transcript matching
+            ocr_lang="ces+eng",          # Czech + English; install with `tesseract --list-langs`
+            use_audio_validation=True,   # require ffmpeg in PATH
+            confidence_threshold=0.6,    # boundaries below this score get needs_review=True
         )
         slides = detector.run()
