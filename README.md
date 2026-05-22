@@ -104,7 +104,7 @@ python main.py [cesta_k_videu]
 Nebo přímo v kódu:
 
 ```python
-from main import SlideDetector
+from slide_detection import SlideDetector
 
 detector = SlideDetector(
     video_path="video.mp4",
@@ -295,31 +295,50 @@ Logger je modul-level `getLogger("SlideDetector")` a setup se volá v `_initiali
 
 ---
 
+## Struktura projektu
+
+Kód je rozdělen do balíčku `slide_detection/`; `main.py` slouží jen jako CLI entry point. Návrh je založen na **kompozici** — orchestrátor `SlideDetector` drží spolupracující komponenty a deleguje na ně.
+
+| Soubor | Obsah |
+|---|---|
+| `main.py` | CLI entry point — spuštění detekce nad videem |
+| `slide_detection/config.py` | `DetectorConfig` — neměnná dataclass se všemi laditelnými parametry |
+| `slide_detection/imaging.py` | Čisté funkce nad snímky (preprocessing, change %, blokové porovnání, `format_time`) |
+| `slide_detection/video.py` | `VideoSource` — metadata videa, vzorkování snímků, načítání podle času |
+| `slide_detection/audio.py` | `AudioAnalyzer` — extrakce audia přes ffmpeg, silence skóre |
+| `slide_detection/postprocess.py` | `PostProcessor` — mergovací průchody (krátké, identické, progressive builds) |
+| `slide_detection/classify.py` | `SlideClassifier` — reklasifikace segmentů na `camera` / `demo` |
+| `slide_detection/confidence.py` | `ConfidenceScorer` — confidence skóre + `needs_review` flag |
+| `slide_detection/export.py` | `SlideExporter` — obrázky slidů, OCR, `slides.json` |
+| `slide_detection/detector.py` | `SlideDetector` — orchestrátor: detekční smyčka + post-processing pipeline |
+
+`SlideDetector` sestaví z konstruktorových argumentů neměnný `DetectorConfig` a v `run()` propojí komponenty (`VideoSource`, `AudioAnalyzer`, `PostProcessor`, `SlideClassifier`, `ConfidenceScorer`, `SlideExporter`). Každá komponenta dostává své závislosti explicitně přes konstruktor, takže jde testovat samostatně.
+
 ## Architektura post-processingu (pořadí je důležité)
 
 ```
-Raw detekce přechodů (s confirm_transitions filtrem proti glitchům)
+Raw detekce přechodů                        ← SlideDetector._detect_raw_slides (+ confirm_transitions)
         ↓
-_merge_camera_segments        ← shluk ≥N krátkých segmentů = camera
+PostProcessor.merge_camera_segments         ← shluk ≥N krátkých segmentů = camera
         ↓
-_merge_short_slides           ← krátké segmenty absorbuje do sousedů
+PostProcessor.merge_short_slides            ← krátké segmenty absorbuje do sousedů
         ↓
-_reclassify_by_face           ← Haar Cascade + saturace → camera
+SlideClassifier.reclassify_by_face          ← Haar Cascade + saturace → camera
         ↓
-_merge_consecutive_noncontent ← sloučí sousední camera/camera nebo demo/demo
+PostProcessor.merge_consecutive_noncontent  ← sloučí sousední camera/camera nebo demo/demo
         ↓
-_merge_progressive_builds     ← PowerPoint bullet-by-bullet → 1 slide
+PostProcessor.merge_progressive_builds      ← PowerPoint bullet-by-bullet → 1 slide
         ↓
-_merge_similar_adjacent       ← vizuálně identické sousední slide → sloučit
+PostProcessor.merge_similar_adjacent        ← vizuálně identické sousední slide → sloučit
         ↓
-_annotate_with_confidence     ← spočítá confidence + needs_review per slide
+ConfidenceScorer.annotate                   ← spočítá confidence + needs_review per slide
         ↓
-_export_slide_images          ← nejostřejší snímek + OCR text
+SlideExporter.export_slide_images           ← nejostřejší snímek + OCR text
         ↓
-_export_json                  ← slides.json pro navazující pipeline
+SlideExporter.export_json                   ← slides.json pro navazující pipeline
 ```
 
-> Pořadí je kritické: `_merge_camera_segments` musí předcházet `_merge_short_slides`, jinak by krátkých segmentů bylo méně a camera-detection by je minula. `_annotate_with_confidence` musí běžet **až po** všech merge fázích, protože měří confidence z finálních hranic.
+> Pořadí je kritické: `merge_camera_segments` musí předcházet `merge_short_slides`, jinak by krátkých segmentů bylo méně a camera-detection by je minula. `ConfidenceScorer.annotate` musí běžet **až po** všech merge fázích, protože měří confidence z finálních hranic.
 
 ## Parametry SlideDetector
 
@@ -368,5 +387,4 @@ Nice-to-have:
 - **CLI argparse** — místo hardcoded listu v `__main__` přijímat `--video`, `--output-dir`, `--config` jako argumenty.
 
 Code quality:
-- **Refactor do modulů** — `main.py` má teď ~860 řádků. Rozdělit na `detector.py`, `postprocess.py`, `classify.py`, `confidence.py`, `audio.py`, `export.py`.
 - **Regression test set** — 3-5 krátkých klipů s ručně anotovaným ground-truth + skript pro precision/recall přechodů.

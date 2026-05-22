@@ -2,3 +2,8 @@ opencv-python~=4.13.0.92
 numpy~=2.2.6
 scenedetect[opencv]
 tqdm~=4.67.3
+
+# STT + paraphrase pipeline
+deepgram-sdk~=3.10
+anthropic~=0.104
+python-dotenv~=1.1
